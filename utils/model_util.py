@@ -40,6 +40,10 @@ def get_model_args(args, data):
         data_rep = 'hml_vec'
         njoints = 251
         nfeats = 1
+    elif args.dataset == 'wmib':
+        data_rep = 'hml_vec'
+        njoints = 189
+        nfeats = 1
 
     return {'modeltype': '', 'njoints': njoints, 'nfeats': nfeats, 'num_actions': num_actions,
             'translation': True, 'pose_rep': 'rot6d', 'glob': True, 'glob_rot': True,
@@ -58,6 +62,12 @@ def create_gaussian_diffusion(args):
     learn_sigma = False
     rescale_timesteps = False
 
+    """
+        beta schedule, in this paper(MDM), the default setting is cosine schedule, which is similar to
+        openai paper "Improved Denoising Diffusion Probabilistic Models"(IDDPM)
+        
+        loss type is MSE
+    """
     betas = gd.get_named_beta_schedule(args.noise_schedule, steps, scale_beta)
     loss_type = gd.LossType.MSE
 
