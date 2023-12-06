@@ -18,6 +18,9 @@ def get_dataset_class(name):
     elif name == "kit":
         from data_loaders.humanml.data.dataset import KIT
         return KIT
+    elif name == 'wmib':
+        from data_loaders.wMIB.dataset import wMIB
+        return wMIB
     else:
         raise ValueError(f'Unsupported dataset name [{name}]')
 
@@ -25,7 +28,7 @@ def get_collate_fn(name, hml_mode='train'):
     if hml_mode == 'gt':
         from data_loaders.humanml.data.dataset import collate_fn as t2m_eval_collate
         return t2m_eval_collate
-    if name in ["humanml", "kit"]:
+    if name in ["humanml", "kit", "wmib"]:
         return t2m_collate
     else:
         return all_collate
@@ -35,6 +38,8 @@ def get_dataset(name, num_frames, split='train', hml_mode='train'):
     DATA = get_dataset_class(name)
     if name in ["humanml", "kit"]:
         dataset = DATA(split=split, num_frames=num_frames, mode=hml_mode)
+    elif name == "wmib":
+        dataset = DATA(split=split, opt=None)
     else:
         dataset = DATA(split=split, num_frames=num_frames)
     return dataset
