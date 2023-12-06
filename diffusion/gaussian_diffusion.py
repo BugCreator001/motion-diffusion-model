@@ -60,6 +60,10 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     for i in range(num_diffusion_timesteps):
         t1 = i / num_diffusion_timesteps
         t2 = (i + 1) / num_diffusion_timesteps
+        """
+            beta_t = 1 - a_bar_t/a_bar_{t-1}
+            See openai paper "IDDPM"
+        """
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
 
@@ -163,6 +167,7 @@ class GaussianDiffusion:
         assert len(betas.shape) == 1, "betas must be 1-D"
         assert (betas > 0).all() and (betas <= 1).all()
 
+        # set num_timesteps according to the length of betas
         self.num_timesteps = int(betas.shape[0])
 
         alphas = 1.0 - betas
@@ -187,6 +192,14 @@ class GaussianDiffusion:
         self.posterior_log_variance_clipped = np.log(
             np.append(self.posterior_variance[1], self.posterior_variance[1:])
         )
+
+        """
+            posterior mean \mu_t(x_t, x_0) = coef1 * x_0 + coef2 * x_t
+            coef1 = (sqrt(a_{t-1})*beta_t) / (1 - a_t)
+            coef2 = (sqrt(a_t)*(1-a_{t-1})) / (1 - a_t)
+            
+            See paper "IDDPM"
+        """
         self.posterior_mean_coef1 = (
             betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
@@ -297,6 +310,14 @@ class GaussianDiffusion:
                  - 'log_variance': the log of 'variance'.
                  - 'pred_xstart': the prediction for x_0.
         """
+
+        """
+            param model: the model that predicts 'mean' and 'variance' of x_0
+                         in this paper, MDM is used
+                         
+            we call create_motion_and_diffusion() to get MDM and diffusion  (see utils/model_utils.py)
+            then pass MDM as the parameter 'model' into p_sample_loop()     (see sample/predict.py)
+        """
         if model_kwargs is None:
             model_kwargs = {}
 
@@ -317,14 +338,21 @@ class GaussianDiffusion:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
             if self.model_var_type == ModelVarType.LEARNED:
+                """
+                    directly predict variance 
+                """
                 model_log_variance = model_var_values
                 model_variance = th.exp(model_log_variance)
             else:
+                """
+                    predict the coefficient ( between [-1, 1] )
+                """
                 min_log = _extract_into_tensor(
                     self.posterior_log_variance_clipped, t, x.shape
                 )
                 max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
                 # The model_var_values is [-1, 1] for [min_var, max_var].
+                # frac now in [0, 1]
                 frac = (model_var_values + 1) / 2
                 model_log_variance = frac * max_log + (1 - frac) * min_log
                 model_variance = th.exp(model_log_variance)
@@ -366,6 +394,9 @@ class GaussianDiffusion:
             model_mean = model_output
         elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:  # THIS IS US!
             if self.model_mean_type == ModelMeanType.START_X:
+                """
+                    case : predict mean of x_0
+                """
                 pred_xstart = process_xstart(model_output)
             else:
                 pred_xstart = process_xstart(
@@ -405,6 +436,14 @@ class GaussianDiffusion:
         )
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        """
+            Helper function to get eps from x_0
+
+            x_t = sqrt(a_cumprod_t) * x_0 + sqrt(1 - a_cumprod_t) * eps
+            ->
+                eps = x_t / sqrt(1 - a_cumprod_t) - sqrt(a_cumprod_t) * x_0 / sqrt(1 - a_cumprod_t)
+                    = .... (see code below)
+        """
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - pred_xstart
@@ -544,6 +583,8 @@ class GaussianDiffusion:
         # print('mean', out["mean"].shape, out["mean"])
         # print('log_variance', out["log_variance"].shape, out["log_variance"])
         # print('nonzero_mask', nonzero_mask.shape, nonzero_mask)
+
+        # 0.5: get standard deviation
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -696,6 +737,7 @@ class GaussianDiffusion:
         if skip_timesteps and init_image is None:
             init_image = th.zeros_like(img)
 
+        # inverse indices index (use [::-1])
         indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
 
         if init_image is not None:
@@ -745,6 +787,10 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
+
+        """
+            Used in a for loop in function: ddim_sample_loop_progressive()
+        """
         out_orig = self.p_mean_variance(
             model,
             x,
@@ -770,6 +816,7 @@ class GaussianDiffusion:
             * th.sqrt(1 - alpha_bar / alpha_bar_prev)
         )
         # Equation 12.
+        # In paper "Denoising Diffusion Implicit Models"
         noise = th.randn_like(x)
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
@@ -1202,17 +1249,38 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
+
+        # vb: variantional lower bound
+
+        """
+            true: calculate mean and variance of x[t-1] from true x[t], x[0] and t
+            
+            q(x_{t-1} | x_0, x_t)
+        """
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=x_start, x_t=x_t, t=t
         )
+
+        """
+            calculate mean and var from x[t], t, and \"predicted"\ x_0
+            
+            p_{\theta}(x_{t-1} | x_t)
+        """
         out = self.p_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
+
+        """
+            KL Divergence, L[t-1] loss
+        """
         kl = normal_kl(
             true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
         )
         kl = mean_flat(kl) / np.log(2.0)
 
+        """
+            L[0] loss
+        """
         decoder_nll = -discretized_gaussian_log_likelihood(
             x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
@@ -1247,6 +1315,11 @@ class GaussianDiffusion:
                                              jointstype='smpl',  # 3.4 iter/sec
                                              vertstrans=False)
 
+        """
+            1. q_sample, sample x_t from x_0(x_start) and t 
+               according to the reparameterization of the margin distribution
+            2. x_t = \sqrt{ a_cumprod_t } * x_0 + \sqrt{1 - a_cumprod_t} * \epsilon
+        """
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -1256,6 +1329,9 @@ class GaussianDiffusion:
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            """
+                We use MSE instead of this here
+            """
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
                 x_start=x_start,
@@ -1267,6 +1343,9 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            """
+                 In MDM we use MSE, so we do not consider the previous 'if' branch
+            """
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -1291,6 +1370,9 @@ class GaussianDiffusion:
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
 
+            """
+                Pay attention: In MDM, we predict x_start(x_0) !!!
+            """
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
@@ -1300,10 +1382,13 @@ class GaussianDiffusion:
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape  # [bs, njoints, nfeats, nframes]
 
-            terms["rot_mse"] = self.masked_l2(target, model_output, mask) # mean_flat(rot_mse)
+            terms["rot_mse"] = self.masked_l2(target, model_output, mask)  # mean_flat(rot_mse)
 
             target_xyz, model_output_xyz = None, None
 
+            """
+                pos: Forward kinematic function converting rot to xyz position in Cartesian coordinates 
+            """
             if self.lambda_rcxyz > 0.:
                 target_xyz = get_xyz(target)  # [bs, nvertices(vertices)/njoints(smpl), 3, nframes]
                 model_output_xyz = get_xyz(model_output)  # [bs, nvertices, 3, nframes]
@@ -1317,6 +1402,10 @@ class GaussianDiffusion:
                     model_output_xyz_vel = (model_output_xyz[:, :, :, 1:] - model_output_xyz[:, :, :, :-1])
                     terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[:, :, :, 1:])
 
+            """
+                fc: foot contact
+                fc_mask is the binary mask set according to the ground truth data
+            """
             if self.lambda_fc > 0.:
                 torch.autograd.set_detect_anomaly(True)
                 if self.data_rep == 'rot6d' and dataset.dataname in ['humanact12', 'uestc']:
@@ -1334,6 +1423,10 @@ class GaussianDiffusion:
                     terms["fc"] = self.masked_l2(pred_vel,
                                                  torch.zeros(pred_vel.shape, device=pred_vel.device),
                                                  mask[:, :, :, 1:])
+
+            """
+                vel: target velocity - predicted velocity
+            """
             if self.lambda_vel > 0.:
                 target_vel = (target[..., 1:] - target[..., :-1])
                 model_output_vel = (model_output[..., 1:] - model_output[..., :-1])
@@ -1551,6 +1644,10 @@ class GaussianDiffusion:
                  - vb: an [N x T] tensor of terms in the lower-bound.
                  - xstart_mse: an [N x T] tensor of x_0 MSEs for each timestep.
                  - mse: an [N x T] tensor of epsilon MSEs for each timestep.
+        """
+
+        """
+            Evaluation, will not be used in training process.
         """
         device = x_start.device
         batch_size = x_start.shape[0]
