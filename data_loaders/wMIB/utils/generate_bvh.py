@@ -21,4 +21,13 @@ def convert_rot6d_to_euler(motion_data):
 
 def save_motion_to_bvh_file(filename, motions):
     np.savetxt(Path(filename), convert_rot6d_to_euler(motions), '%s', ' ', '\n')
+
+    with open(Path(filename), 'r+') as f:
+        content = f.read()
+        f.seek(0)
+        with open('./data_loaders/wMIB/skeleton.txt') as f2:  # bvh skeleton
+            f.write(f2.read())
+
+        f.write(content)
+
     print('Saved bvh path:', filename)
