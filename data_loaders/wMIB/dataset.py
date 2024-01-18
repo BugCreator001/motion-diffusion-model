@@ -23,7 +23,7 @@ from data_loaders.wMIB.bvh_converter import BVHConverter
 from utils.rotation_conversions import euler_angles_to_matrix, matrix_to_rotation_6d
 from utils.rotation_conversions import matrix_to_euler_angles
 from data_loaders.wMIB.nlp_consts import fix_spell
-#import spacy
+import spacy
 from data_loaders.humanml.utils.get_opt import get_opt
 from data_loaders.humanml.utils.word_vectorizer import WordVectorizer
 from data_loaders.wMIB.utils.generate_bvh import save_motion_to_bvh_file
@@ -31,7 +31,6 @@ from data_loaders.wMIB.utils.generate_bvh import save_motion_to_bvh_file
 from data_loaders.wMIB.cal_mean_variance import mean_variance
 import math
 
-"""
 nlp = spacy.load('en_core_web_sm')
 
 
@@ -51,7 +50,7 @@ def process_text(sentence):
             word_list.append(word)
         pos_list.append(token.pos_)
     return word_list, pos_list
-"""
+
 
 class Action:
     def __init__(self, prev_action_anno, cur_action_anno):
@@ -84,7 +83,6 @@ class Action:
         self.description.append(fix_spell(self.orientation))
         self.description.append(fix_spell(self.turning))
 
-"""
         def get_tokens(caption):
             word_list, pose_list = process_text(caption)
             return ['%s/%s' % (word_list[i], pose_list[i]) for i in range(len(word_list))]
@@ -92,7 +90,7 @@ class Action:
         self.tokens_data = []
         for k, text in enumerate(self.description):
             self.tokens_data.extend(get_tokens(text))
-"""
+
         # print(self.tokens_data)
 
 
@@ -362,8 +360,8 @@ class ActionLoader:
                                 data_dict[new_name] = {
                                     'motion': action_data_rot6d,
                                     'length': len(action_data_rot6d),
-                                    # 'text': action.tokens_data,
-                                    'text': action.description,
+                                    'text': action.tokens_data,
+                                    # 'text': action.description,
                                     'caption': action.caption,
                                     'desc': action.description
                                 }
