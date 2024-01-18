@@ -14,10 +14,11 @@ def convert_rot6d_to_euler(motion_data):
         matrix = rotation_6d_to_matrix(torch.from_numpy(sub_arr))
         euler = matrix_to_euler_angles(matrix, 'XYZ')
 
-        motion_euler = np.hstack((motion_euler, euler.numpy()))
+        motion_euler = np.hstack((motion_euler, euler.numpy()*180./3.1415926))
 
     return motion_euler
 
 
 def save_motion_to_bvh_file(filename, motions):
     np.savetxt(Path(filename), convert_rot6d_to_euler(motions), '%s', ' ', '\n')
+    print('Saved bvh path:', filename)

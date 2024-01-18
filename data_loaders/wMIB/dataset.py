@@ -27,6 +27,10 @@ from data_loaders.wMIB.nlp_consts import fix_spell
 import spacy
 from data_loaders.humanml.utils.get_opt import get_opt
 from data_loaders.humanml.utils.word_vectorizer import WordVectorizer
+from data_loaders.wMIB.utils.generate_bvh import save_motion_to_bvh_file
+
+from data_loaders.wMIB.cal_mean_variance import mean_variance
+import math
 
 nlp = spacy.load('en_core_web_sm')
 
@@ -55,13 +59,19 @@ class Action:
             self.start_frame = 0
         else:
             self.start_frame = int(prev_action_anno["tag"][0])
-        self.end_frame = int(cur_action_anno["tag"][0])
+        self.end_frame = int(cur_action_anno["tag"][0]) - 1
         self.length = self.end_frame - self.start_frame
         self.action = tuple(cur_action_anno["tag"][1].split("+"))
         self.caption = random.choice(self.action)
-        self.speed = cur_action_anno["tag"][2]
-        self.orientation = cur_action_anno["tag"][3]
-        self.turning = cur_action_anno["tag"][4]
+
+        if len(cur_action_anno["tag"]) > 2:
+            self.speed = cur_action_anno["tag"][2]
+            self.orientation = cur_action_anno["tag"][3]
+            self.turning = cur_action_anno["tag"][4]
+        else:
+            self.speed = ""
+            self.orientation = ""
+            self.turning = ""
 
         # preprocess description:
         # After this, description will look like ['stoop', 'pick up', '中', '右前', '无转向'],
@@ -94,6 +104,7 @@ class MotionAnno:
         self.id = anno['detailId']
 
         self.file_path = Path(path.replace('mp4_2x', 'bvh')) / Path(name).with_suffix('')
+        # print(self.file_path)
 
         self.objects = anno["detailLabel"]["objects"]
         self.tags = anno["detailLabel"]["tags"]
@@ -109,6 +120,9 @@ class MotionAnno:
         """
             这个数据集的标注是从最后一个动作开始的，并且只给了每个动作的结束帧，因此需要特别处理一下
             calc_anno_statistics.py 里搞反了
+            
+            ？最新的数据又改回来了
+        """
         """
         self.action_list = []
         for i in range(len(self.cut_anno["value"])):
@@ -116,17 +130,27 @@ class MotionAnno:
                 self.action_list.append(Action(None, self.cut_anno["value"][i]))
             else:
                 self.action_list.append(Action(self.cut_anno["value"][i + 1], self.cut_anno["value"][i]))
+        """
+        self.action_list = []
+        for i in range(len(self.cut_anno["value"])):
+            if i == 0:
+                self.action_list.append(Action(None, self.cut_anno["value"][i]))
+            else:
+                self.action_list.append(Action(self.cut_anno["value"][i - 1], self.cut_anno["value"][i]))
+
+
+        # print(len(self.action_list))
 
 
 def movement_to_rot6d(motion_data):
     """
-        该函数的过程和 movement_save_init() 一致，注释将被放在下一函数中
+        该函数的过程和 movement_save_init() 一致，因为不想写两遍，所以关于怎么把动作放在原点，面向y+方向的注释将被放在下一函数中
         Transform Euler angle in motion data into rot6d representation
         bvh motion structure: [root position x/y/z, root rotation x/y/z, child rotation x/y/z * n]
 
         Also, we do a preprocessing progress in this step,
         where the initial position of each movement will be placed at (0, 0, 0) and
-        all motion will face x- direction initially.
+        all motion will face y+ direction initially.
 
         Param:
             motion_data: dataframe, shape [frame, root_xyz + rotation * 3 * joints]
@@ -139,10 +163,10 @@ def movement_to_rot6d(motion_data):
     num_cols = motions.shape[1]
 
     # Path
-    # Attention: xyz in bvh -> xzy in houdini (maybe, but the order is not the same)
+    # Attention: xyz in bvh -> xzy in houdini (maybe)
     init_euler = euler_angles_to_matrix(torch.from_numpy(motions[0, 3: 6] * 3.1415926 / 180.), 'XYZ')
-    rot_vec = torch.matmul(init_euler, torch.from_numpy(np.array([0., 0., 1.])).reshape((3, 1)))
-    rot_e = -np.arccos(rot_vec[0] / np.sqrt(rot_vec[0] ** 2 + rot_vec[2] ** 2))
+    rot_vec = torch.matmul(init_euler, torch.from_numpy(np.array([[1.], [0.], [0.]])))
+    rot_e = math.atan2(rot_vec[2], rot_vec[0])
     rot_e = float(rot_e)
 
     joint_rot = np.array([
@@ -162,7 +186,7 @@ def movement_to_rot6d(motion_data):
     # Euler Angle
     rot_mat = torch.from_numpy(joint_rot).reshape((3, 3))
     joint_euler_mat = euler_angles_to_matrix(torch.from_numpy(motions[:, 3: 6] * 3.1415926 / 180.), 'XYZ')
-    joint_rot_mat = torch.matmul(rot_mat.reshape(1, 3, 3), joint_euler_mat)
+    joint_rot_mat = torch.matmul(rot_mat, joint_euler_mat)
     new_euler = matrix_to_euler_angles(joint_rot_mat, 'XYZ')
     # print(new_euler)
     for i in range(0, num_cols, 3):
@@ -170,11 +194,18 @@ def movement_to_rot6d(motion_data):
         if i == 0:
             # initial motion will be moved to (0, 0, 0)
             motion_rot6d = np.hstack((motion_rot6d, new_root_pos))
-        else:
-            rot_6d = matrix_to_rotation_6d(euler_angles_to_matrix(torch.from_numpy(sub_arr), 'XYZ'))
-            if i == 3:  # root rotations
-                rot_6d = matrix_to_rotation_6d(euler_angles_to_matrix(new_euler, 'XYZ'))
+        elif i == 3:
+            rot_6d = matrix_to_rotation_6d(euler_angles_to_matrix(new_euler, 'XYZ'))
             motion_rot6d = np.hstack((motion_rot6d, rot_6d))
+        else:
+            rot_6d = matrix_to_rotation_6d(euler_angles_to_matrix(torch.from_numpy(sub_arr) * 3.1415926/180., 'XYZ'))
+            motion_rot6d = np.hstack((motion_rot6d, rot_6d))
+
+    """
+        Check whether bhv files are converted correctly.
+    """
+    # print(motion_rot6d.shape)
+    # save_motion_to_bvh_file('./test.bvh', motion_rot6d)
 
     return motion_rot6d
 
@@ -194,7 +225,7 @@ def movement_save_init(motion_data, filename):
         由于 bvh 文件中除 root 之外的部分均为相对坐标，故归一化的过程仅需改变 motions[:, 0:6] 的值
     """
     motions = np.array(motion_data)
-    init = motions[0, 0: 3] # root_x, root_y, root_z
+    init = motions[0, 0: 3]  # root_x, root_y, root_z
     motion_rot6d = np.empty((motions.shape[0], 0))
     num_cols = motions.shape[1]
     num_rows = motions.shape[0]
@@ -218,34 +249,63 @@ def movement_save_init(motion_data, filename):
     """
 
     # 1. Path， 旋转+移动回原点
-    # Attention: xyz in bvh -> xzy in houdini (maybe, I'm mot sure about that, but the order is not the same)
-    init_euler = euler_angles_to_matrix(torch.from_numpy(motions[0, 3: 6] * 3.1415926 / 180.), 'XYZ')
-    rot_vec = torch.matmul(init_euler, torch.from_numpy(np.array([0., 0., 1.])).reshape((3, 1)))
-    rot_e = -np.arccos(rot_vec[0] / np.sqrt(rot_vec[0] ** 2 + rot_vec[2] ** 2))
+    # Attention: xyz in bvh are intrinsic
+    # and bvh file (x, y, z) means (x, z, y) in blender, I don't know why
+    init_eulerMat = euler_angles_to_matrix(torch.from_numpy(motions[0, 3: 6] * math.pi / 180.), 'XYZ')
+    print(init_eulerMat.shape)
+
+    # 找一下骨盆局部坐标系的 x 轴正方向经过欧拉角转了之后跑到了哪里，然后把这个正方向的 xy 平面投影和 x 轴正方形对齐
+    # 有一说一，应该是xz平面，反正我试了一下motion[:,2]控制的是z轴位置，鬼知道为什么
+    # 总之就是非常玄学（能用就行
+    rot_vec = torch.matmul(init_eulerMat, torch.tensor(np.array([[1.0], [0.], [0.]])))
+    print(rot_vec)
+
+    # rot_vec在xy平面投影与(1, 0, 0)的夹角，找反向转回来的矩阵
+    rot_e = math.atan2(rot_vec[2], rot_vec[0])
     rot_e = float(rot_e)
 
     joint_rot = np.array([
-        np.cos(rot_e), 0, np.sin(rot_e),
-        0, 1, 0,
-        -np.sin(rot_e), 0, np.cos(rot_e)
+        [math.cos(rot_e), 0., math.sin(rot_e)],
+        [0., 1., 0.],
+        [-math.sin(rot_e), 0., math.cos(rot_e)]
     ])
+    #joint_rot = np.array([
+    #    [math.cos(rot_e), math.sin(rot_e), 0.],
+    #    [-math.sin(rot_e), math.cos(rot_e), 0.],
+    #    [0., 0., 1.]
+    #])
 
-    rot_mat = torch.from_numpy(joint_rot).reshape((3, 3))
-    path_rotation_mat = torch.matmul(rot_mat, torch.from_numpy(motions[:, 0: 3]).transpose(1, 0))
+    rot_mat = torch.from_numpy(joint_rot)  # .reshape((3, 3))
+    print(torch.matmul(rot_mat, rot_vec))
+
+    # permute_motions = motions[:, 0: 3]
+    # permute_motions[:, 1] = motions[:, 2]
+    # permute_motions[:, 2] = motions[:, 1]
+
+    path_rotation_mat = torch.matmul(rot_mat, torch.from_numpy(motions[:, 0: 3]).permute(1, 0))
     path_rotation_mat = path_rotation_mat.transpose(1, 0)
+
     # print(path_rotation_mat - motions[:, 0:3])
+    # motions[:, 0] = path_rotation_mat.numpy()[:, 0]
+    # motions[:, 1] = path_rotation_mat.numpy()[:, 2]
+    # motions[:, 2] = path_rotation_mat.numpy()[:, 1]
+
+    # new_init_pos = motions[0, 0: 3]
+    # new_root_pos = motions[:, 0: 3] - new_init_pos
 
     new_init_pos = path_rotation_mat.numpy()[0, :]
     new_root_pos = path_rotation_mat.numpy() - new_init_pos
 
+    # new_root_pos[:, 2] += 10.0
+
     # 2. Euler Angle，欧拉角转来转去
-    rot_mat = torch.from_numpy(joint_rot).reshape((3, 3))
+    # rot_mat = torch.from_numpy(joint_rot).reshape((3, 3))
 
     """
         弧度制注意 ！！
     """
-    joint_euler_mat = euler_angles_to_matrix(torch.from_numpy(motions[:, 3: 6] * 3.1415926 / 180.), 'XYZ')
-    joint_rot_mat = torch.matmul(rot_mat.reshape(1, 3, 3), joint_euler_mat)
+    joint_euler_mat = euler_angles_to_matrix(torch.from_numpy(motions[:, 3: 6] * math.pi / 180.), 'XYZ')
+    joint_rot_mat = torch.matmul(rot_mat, joint_euler_mat)
     new_euler = matrix_to_euler_angles(joint_rot_mat, 'XYZ')
 
     for i in range(0, num_cols, 3):
@@ -255,72 +315,93 @@ def movement_save_init(motion_data, filename):
             motion_rot6d = np.hstack((motion_rot6d, new_root_pos))
         elif i == 3:
             # 记得把弧度转回来
-            motion_rot6d = np.hstack((motion_rot6d, new_euler * 180./3.1415926))
+            motion_rot6d = np.hstack((motion_rot6d, new_euler * 180. / math.pi))
         else:
             motion_rot6d = np.hstack((motion_rot6d, sub_arr))
 
-    np.savetxt(Path('./motion_segment') / Path(filename + '.bvh'), motion_rot6d, '%s', ' ', '\n')
+    np.savetxt(Path('./data_loaders/wMIB/motion_segment') / Path(filename + '.bvh'), motion_rot6d, '%s', ' ', '\n')
 
 class ActionLoader:
-    def __init__(self, datapath: str):
+    def __init__(self, datapath: str, load_from_npz=False):
 
         data_dict = {}
         new_name_list = []
         filelen = sum([1 for i in open(Path(datapath))])
 
-        with open(Path(datapath), 'r') as f:
-            for idx, line in tqdm(enumerate(f), 'Loading dataset', total=filelen):  # .readlines():
-                # get annotation from json file
-                anno = json.loads(line)
-                if anno['detailStatus'] == "已标注":
-                    try:
-                        # preprocessing of file path according to Readme
-                        motions = MotionAnno(anno)
+        if load_from_npz == False:
+            with open(Path(datapath), 'r') as f:
+                for idx, line in tqdm(enumerate(f), 'Loading dataset', total=filelen):  # .readlines():
+                    # get annotation from json file
+                    anno = json.loads(line)
+                    if anno['detailStatus'] == "已标注":
+                        try:
+                            # preprocessing of file path according to Readme
+                            motions = MotionAnno(anno)
 
-                        converter = BVHConverter(Path('./data_loaders/wMIB/') / motions.file_path)
-                        for action in motions.action_list:
-                            start = action.start_frame
-                            end = action.end_frame
-                            # print(action.start_frame, action.end_frame, action.action)
+                            converter = BVHConverter(Path('./data_loaders/wMIB/') / motions.file_path)
+                            for action in motions.action_list:
+                                start = action.start_frame
+                                end = action.end_frame
+                                if end - start > 196:
+                                    continue
+                                # print(action.start_frame, action.end_frame, action.action)
 
-                            action_data = converter.get_frames(start, end)
+                                action_data = converter.get_frames(start, end)
 
-                            action_data_rot6d = movement_to_rot6d(action_data)
+                                action_data_rot6d = movement_to_rot6d(action_data)
 
-                            # 统计数据里貌似有>20个动作的序列(虽然不多)，因此用两个随机字母让名字不至于用完
-                            new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_'\
-                                       + random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + str(motions.id)
-                            while new_name in new_name_list:
+                                # 统计数据里貌似有>20个动作的序列(虽然不多)，因此用两个随机字母让名字不至于用完
                                 new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_'\
                                            + random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + str(motions.id)
-                            # print(new_name)
+                                while new_name in new_name_list:
+                                    new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_'\
+                                               + random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + str(motions.id)
+                                # print(new_name)
 
-                            data_dict[new_name] = {
-                                'motion': action_data_rot6d,
-                                'length': len(action_data_rot6d),
-                                'text': action.tokens_data,
-                                'caption': action.caption
-                            }
+                                data_dict[new_name] = {
+                                    'motion': action_data_rot6d,
+                                    'length': len(action_data_rot6d),
+                                    'text': action.tokens_data,
+                                    'caption': action.caption,
+                                    'desc': action.description
+                                }
 
-                            # this if branch is just for test
-                            # if data_dict[new_name]['length'] == 231:
-                            #     movement_save_init(action_data, new_name)
-                            # print(data_dict[new_name]['text'])
+                                # this if branch is just for test
+                                #if data_dict[new_name]['length'] % 3 == 0:
+                                # movement_save_init(action_data, new_name)
+                                # print(data_dict[new_name]['desc'], new_name)
 
-                            new_name_list.append(new_name)
+                                new_name_list.append(new_name)
 
-                    except:
-                        pass
+                        except:
+                            print("wrong annotation")
+                            pass
 
-        """
-            data_dict contains the separated motion data in bvh, 
-            length of each motion, and labels about each motion
-            
-            new_name_list is a helper array to get items from data_dict
-        """
-        self.data_dict = data_dict
-        self.new_name_list = new_name_list
-        # print(data_dict[new_name_list[0]]['text'])
+            """
+                data_dict contains the separated motion data in bvh, 
+                length of each motion, and labels about each motion
+                
+                new_name_list is a helper array to get items from data_dict
+            """
+            self.data_dict = data_dict
+            self.new_name_list = new_name_list
+            # print(data_dict[new_name_list[0]]['text'])
+            np.savez('./data_loaders/wMIB/processed_data/motion_data.npz', **data_dict)
+            np.savez('./data_loaders/wMIB/processed_data/motion_name.npz', new_name_list=new_name_list)
+
+        # self.mean, self.std = mean_variance(self.data_dict)
+        else:
+
+            self.data_dict = {}
+            with np.load('./data_loaders/wMIB/processed_data/motion_data.npz', allow_pickle=True) as motion_data:
+                self.motion_dict = dict(motion_data.items())
+            names = np.load('./data_loaders/wMIB/processed_data/motion_name.npz', allow_pickle=True)
+            self.new_name_list = names['new_name_list']
+
+            for _, name in tqdm(enumerate(self.new_name_list), desc='Loading motion segments',total=len(self.new_name_list)):
+                self.data_dict[name] = self.motion_dict[name].item()
+            # print(self.data_dict[self.new_name_list[0]])
+
 
 """
 class wMIB(Dataset):
@@ -357,17 +438,18 @@ class wMIB(Dataset):
 """
 
 class wMIB_Text2MotionDataset(Dataset):
-    def __init__(self, mean, std, opt, w_vectorizer, datapath, **kwargs):
+    def __init__(self, opt, w_vectorizer, datapath, **kwargs):
 
         self.dataname = 'wMIB'
-        self.action_loader = ActionLoader(datapath)
+        self.action_loader = ActionLoader(datapath, load_from_npz=True)
         self.w_vectorizer = w_vectorizer
         self.max_length = 20
         self.pointer = 0
-        self.max_motion_length = 200
-        self.mean = np.zeros([189], dtype=np.float32)  # data is already normalized
-        self.std = np.ones([189], dtype=np.float32)  # data is already normalized
+        self.max_motion_length = 196
+        #self.mean = np.zeros([189], dtype=np.float32)  # data is already normalized
+        #self.std = np.ones([189], dtype=np.float32)  # data is already normalized
         self.opt = opt
+        self.mean, self.std = mean_variance(self.action_loader.data_dict, self.action_loader.new_name_list)
 
     def __len__(self):
         return len(self.action_loader.new_name_list)
@@ -386,7 +468,8 @@ class wMIB_Text2MotionDataset(Dataset):
         tokens = batch['text']
         motion = batch['motion']
         m_length = batch['length']
-        caption = batch['caption']
+        caption = ' '.join(batch['desc'])
+        # print(caption)
 
         if len(tokens) < self.opt.max_text_len:
             # pad with "unk"
@@ -418,26 +501,30 @@ class wMIB_Text2MotionDataset(Dataset):
         elif coin2 == 'single':
             m_length = (m_length // self.opt.unit_length) * self.opt.unit_length
 
-        idx = random.randint(0, abs(len(motion) - m_length))
-
+        # idx = random.randint(0, abs(len(motion) - m_length))
+        idx = 0
         motion = motion[idx:idx + m_length]
 
         "Z Normalization"
         motion = (motion - self.mean) / self.std
 
-        if m_length <= self.max_motion_length:
-            motion = np.concatenate([motion,
-                                     np.zeros((self.max_motion_length - m_length, motion.shape[1]))
-                                     ], axis=0)
+        #if m_length <= self.max_motion_length:
+        #    motion = np.concatenate([motion,
+        #                             np.zeros((self.max_motion_length - m_length, motion.shape[1]))
+        #                             ], axis=0)
         # print(word_embeddings.shape, motion.shape)
         # print(tokens)
-        return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens)
+        return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, ' '.join(tokens)
 
 
 class wMIB(Dataset):
     def __init__(self, opt, split="train", **kwargs):
 
         self.split = split
+
+        """
+            json file path here
+        """
         self.datapath = './data_loaders/wMIB/annotated_samples.json'
         abs_base_path = f'.'
 
@@ -459,7 +546,7 @@ class wMIB(Dataset):
             opt.decomp_name = 'Decomp_SP001_SM001_H512_babel_2700epoch'
             opt.meta_root = pjoin(opt.checkpoints_dir, opt.dataset_name, 'motion1', 'meta')
             opt.min_motion_length = 0 # must be at least window size
-            opt.max_motion_length = 200
+            opt.max_motion_length = 196
         self.opt = opt
 
         print('Loading dataset %s ...' % opt.dataset_name)
@@ -467,18 +554,18 @@ class wMIB(Dataset):
         self.dataset_name = opt.dataset_name
         self.dataname = opt.dataset_name
 
-        self.mean = np.zeros([opt.dim_pose], dtype=np.float32)  # data is already normalized
-        self.std = np.ones([opt.dim_pose], dtype=np.float32)  # data is already normalized
+        # self.mean = np.zeros([opt.dim_pose], dtype=np.float32)  # data is already normalized
+        # self.std = np.ones([opt.dim_pose], dtype=np.float32)  # data is already normalized
 
         DATA = wMIB_Text2MotionDataset
 
         self.w_vectorizer = WordVectorizer('./glove', 'our_vab')
         self.t2m_dataset = DATA(
             opt=self.opt,
-            mean=self.mean, std=self.std, w_vectorizer=self.w_vectorizer, datapath=self.datapath,
+            w_vectorizer=self.w_vectorizer, datapath=self.datapath,
         )
         self.num_actions = 1  # dummy placeholder
-        print(len(self.t2m_dataset))
+        print("Dataset size:", len(self.t2m_dataset))
         assert len(self.t2m_dataset) > 1, 'You loaded an empty dataset, ' \
                                           'it is probably because your data dir has only texts and no motions.\n' \
                                           'To train and evaluate MDM you should get the FULL data as described ' \

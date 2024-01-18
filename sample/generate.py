@@ -15,8 +15,10 @@ from data_loaders.get_data import get_dataset_loader
 from data_loaders.humanml.scripts.motion_process import recover_from_ric
 import data_loaders.humanml.utils.paramUtil as paramUtil
 from data_loaders.humanml.utils.plot_script import plot_3d_motion
+from data_loaders.wMIB.utils.generate_bvh import save_motion_to_bvh_file
 import shutil
 from data_loaders.tensors import collate
+from pathlib import Path
 
 
 def main():
@@ -25,7 +27,7 @@ def main():
     out_path = args.output_dir
     name = os.path.basename(os.path.dirname(args.model_path))
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '')
-    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
+    max_frames = 196 if args.dataset in ['kit', 'humanml', 'wmib'] else 60
     fps = 12.5 if args.dataset == 'kit' else 20
     n_frames = min(max_frames, int(args.motion_length*fps))
     is_using_data = not any([args.input_text, args.text_prompt, args.action_file, args.action_name])
@@ -66,7 +68,7 @@ def main():
     # (specify through the --seed flag)
     args.batch_size = args.num_samples  # Sampling a single batch from the testset, with exactly args.num_samples
 
-    print('Loading dataset...')
+    print(f'Loading dataset [{args.dataset}]...')
     data = load_dataset(args, max_frames, n_frames)
     total_num_samples = args.num_samples * args.num_repetitions
 
@@ -126,17 +128,18 @@ def main():
         )
 
         # Recover XYZ *positions* from HumanML3D vector representation
-        if model.data_rep == 'hml_vec':
-            n_joints = 22 if sample.shape[1] == 263 else 21
-            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
-            sample = recover_from_ric(sample, n_joints)
-            sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
+        if args.dataset != 'wmib':
+            if model.data_rep == 'hml_vec':
+                n_joints = 22 if sample.shape[1] == 263 else 21
+                sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
+                sample = recover_from_ric(sample, n_joints)
+                sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
 
-        rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
-        rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()
-        sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
-                               jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
-                               get_rotations_back=False)
+            rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
+            rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()
+            sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
+                                   jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
+                                   get_rotations_back=False)
 
         if args.unconstrained:
             all_text += ['unconstrained'] * args.num_samples
@@ -144,11 +147,17 @@ def main():
             text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
             all_text += model_kwargs['y'][text_key]
 
-        all_motions.append(sample.cpu().numpy())
+        if args.dataset != 'wmib':
+            all_motions.append(sample.cpu().numpy())
+        else:
+            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
+            # print(sample.shape)
+            sample = sample.permute(0, 3, 1, 2)
+            all_motions.append(sample.cpu().numpy())
+
         all_lengths.append(model_kwargs['y']['lengths'].cpu().numpy())
 
         print(f"created {len(all_motions) * args.batch_size} samples")
-
 
     all_motions = np.concatenate(all_motions, axis=0)
     all_motions = all_motions[:total_num_samples]  # [bs, njoints, 6, seqlen]
@@ -169,34 +178,57 @@ def main():
     with open(npy_path.replace('.npy', '_len.txt'), 'w') as fw:
         fw.write('\n'.join([str(l) for l in all_lengths]))
 
-    print(f"saving visualizations to [{out_path}]...")
-    skeleton = paramUtil.kit_kinematic_chain if args.dataset == 'kit' else paramUtil.t2m_kinematic_chain
+    if args.dataset != 'wmib':
+        print(f"saving visualizations to [{out_path}]...")
+        skeleton = paramUtil.kit_kinematic_chain if args.dataset == 'kit' else paramUtil.t2m_kinematic_chain
 
-    sample_files = []
-    num_samples_in_out_file = 7
+        sample_files = []
+        num_samples_in_out_file = 7
 
-    sample_print_template, row_print_template, all_print_template, \
-    sample_file_template, row_file_template, all_file_template = construct_template_variables(args.unconstrained)
+        sample_print_template, row_print_template, all_print_template, \
+        sample_file_template, row_file_template, all_file_template = construct_template_variables(args.unconstrained)
 
-    for sample_i in range(args.num_samples):
-        rep_files = []
-        for rep_i in range(args.num_repetitions):
-            caption = all_text[rep_i*args.batch_size + sample_i]
-            length = all_lengths[rep_i*args.batch_size + sample_i]
-            motion = all_motions[rep_i*args.batch_size + sample_i].transpose(2, 0, 1)[:length]
-            save_file = sample_file_template.format(sample_i, rep_i)
-            print(sample_print_template.format(caption, sample_i, rep_i, save_file))
-            animation_save_path = os.path.join(out_path, save_file)
-            plot_3d_motion(animation_save_path, skeleton, motion, dataset=args.dataset, title=caption, fps=fps)
-            # Credit for visualization: https://github.com/EricGuo5513/text-to-motion
-            rep_files.append(animation_save_path)
+        for sample_i in range(args.num_samples):
+            rep_files = []
+            for rep_i in range(args.num_repetitions):
+                caption = all_text[rep_i*args.batch_size + sample_i]
+                length = all_lengths[rep_i*args.batch_size + sample_i]
+                motion = all_motions[rep_i*args.batch_size + sample_i].transpose(2, 0, 1)[:length]
+                save_file = sample_file_template.format(sample_i, rep_i)
+                print(sample_print_template.format(caption, sample_i, rep_i, save_file))
+                animation_save_path = os.path.join(out_path, save_file)
+                plot_3d_motion(animation_save_path, skeleton, motion, dataset=args.dataset, title=caption, fps=fps)
+                # Credit for visualization: https://github.com/EricGuo5513/text-to-motion
+                rep_files.append(animation_save_path)
 
-        sample_files = save_multiple_samples(args, out_path,
-                                               row_print_template, all_print_template, row_file_template, all_file_template,
-                                               caption, num_samples_in_out_file, rep_files, sample_files, sample_i)
+            sample_files = save_multiple_samples(args, out_path,
+                                                   row_print_template, all_print_template, row_file_template, all_file_template,
+                                                   caption, num_samples_in_out_file, rep_files, sample_files, sample_i)
 
-    abs_path = os.path.abspath(out_path)
-    print(f'[Done] Results are at [{abs_path}]')
+        abs_path = os.path.abspath(out_path)
+        print(f'[Done] Results are at [{abs_path}]')
+    else:
+        print(f"saving visualizations to [{out_path}]...")
+        sample_print_template, row_print_template, all_print_template, \
+            sample_file_template, row_file_template, all_file_template = construct_template_variables(
+            args.unconstrained)
+
+        for sample_i in range(args.num_samples):
+            rep_files = []
+            for rep_i in range(args.num_repetitions):
+                caption = all_text[rep_i*args.batch_size + sample_i]
+                length = all_lengths[rep_i*args.batch_size + sample_i]
+                motion = all_motions[rep_i*args.batch_size + sample_i].transpose(2, 0, 1)[:length]
+                print(motion.shape[1], motion.shape[2])
+                motion = motion.reshape((motion.shape[0], motion.shape[1] * motion.shape[2]))
+                print(motion.shape)
+                save_file = sample_file_template.format(sample_i, rep_i)
+                print(sample_print_template.format(caption, sample_i, rep_i, save_file))
+                animation_save_path = Path(os.path.join(out_path, save_file)).with_suffix('.bvh')
+                save_motion_to_bvh_file(animation_save_path, motion)
+
+        abs_path = os.path.abspath(Path(out_path).with_suffix('.bvh'))
+        print(f'[Done] Results are at [{abs_path}]')
 
 
 def save_multiple_samples(args, out_path, row_print_template, all_print_template, row_file_template, all_file_template,

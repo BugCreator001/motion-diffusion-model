@@ -41,7 +41,7 @@ def get_model_args(args, data):
         njoints = 251
         nfeats = 1
     elif args.dataset == 'wmib':
-        data_rep = 'hml_vec'
+        data_rep = 'rot6d'
         njoints = 189
         nfeats = 1
 

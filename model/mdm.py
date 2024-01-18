@@ -135,6 +135,7 @@ class MDM(nn.Module):
             texts = torch.cat([texts, zero_pad], dim=1)
             # print('texts after pad', texts.shape, texts)
         else:
+            # print('texts', raw_text)
             texts = clip.tokenize(raw_text, truncate=True).to(device) # [bs, context_length] # if n_tokens > 77 -> will truncate
         return self.clip_model.encode_text(texts).float()
 
